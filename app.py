@@ -2,163 +2,541 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
+import plotly.graph_objects as go
+from fpdf import FPDF
+import base64
+import math
+from datetime import datetime
 
-# --- BAGIAN 1: BACKEND ENGINE (Logic Kita) ---
+# ==========================================
+# BAGIAN 1: BACKEND ENGINE
+# ==========================================
 class BuildingPerformanceEngine:
     def __init__(self, model_path='Energy_Model-Scaler_GBR.pkl'):
-        # Load Model & Scaler
         try:
             artifacts = joblib.load(model_path)
             self.model = artifacts['model']
             self.scaler = artifacts['scaler']
         except FileNotFoundError:
-            st.error("File Model tidak ditemukan! Pastikan 'Energy_Model-Scaler_GBR.pkl' ada di folder yang sama.")
+            st.error("⚠️ File Model tidak ditemukan! Pastikan 'Energy_Model-Scaler_GBR.pkl' ada di folder yang sama.")
             st.stop()
         
-        # Konstanta Dataset Ecotect
         self.V_REF = 771.75
         
     def process_building(self, u):
-        # 1. Hitung Geometri Real (Phase 2)
+        # 1. Hitung Geometri Real
         H_real = 3.5 if u['lantai'] == 1 else 7.0
         V_real = (u['A1'] * 3.5) + (u['A2'] * 3.5)
         
-        # Surface Area Real
         W_real = (u['P1'] * 3.5) + (u['P2'] * 3.5)
         R_real = max(u['A1'], u['A2'])
         F_real = u['A1']
         S_real = W_real + R_real + F_real
         
-        # Hitung RC DNA
+        if S_real == 0: S_real = 1 
+        
         RC_real = (6 * (V_real**(0.6667))) / S_real
         Total_Area = u['A1'] + u['A2']
         
-        # 2. Miniaturisasi & Prediksi (Phase 3)
         note = ""
         
-        # --- JALUR A: NORMAL SHAPE (RC >= 0.62) ---
+        # 2. Miniaturisasi Input
         if RC_real >= 0.62:
-            X1 = min(0.98, RC_real) # Clamping atas
-            X2 = (6 * (self.V_REF**(0.6667))) / X1 # Surface Mini
+            X1 = min(0.98, RC_real)
+            X2 = (6 * (self.V_REF**(0.6667))) / X1
             X5 = H_real
-            X4 = 220.5 if X5 == 3.5 else 110.25 # Roof Mini
-            X3 = X2 - (2 * X4) # Wall Mini
+            X4 = 220.5 if X5 == 3.5 else 110.25
+            X3 = X2 - (2 * X4)
             
-            # Predict
             feat = np.array([[X1, X2, X3, X4, X5, u['O'], u['RG'], u['Dist']]])
             raw = self.model.predict(self.scaler.transform(feat))[0]
             
-            # EUI Bridge
-            eui_cool = raw[1] / 220.5
-            eui_heat = raw[0] / 220.5
+            eui_cool = raw[1]
+            eui_heat = raw[0]
             note = "Metode: Interpolasi GBR (Normal Shape)"
 
-        # --- JALUR B: EXTREME SHAPE (RC < 0.62) ---
         else:
-            # Base Bungalow Reference (RC 0.62)
             X1_ref = 0.62
             X2_ref = (6 * (self.V_REF**(0.6667))) / 0.62
             X5_ref = 3.5
             X4_ref = 220.5
             X3_ref = X2_ref - (2 * 220.5)
             
-            # Predict Base
             feat_ref = np.array([[X1_ref, X2_ref, X3_ref, X4_ref, X5_ref, u['O'], u['RG'], u['Dist']]])
             base_pred = self.model.predict(self.scaler.transform(feat_ref))[0]
             
-            eui_cool = base_pred[1] / 220.5
-            eui_heat = base_pred[0] / 220.5
+            eui_cool = base_pred[1]
+            eui_heat = base_pred[0]
             
-            # Penalty Factor (Makin gepeng makin boros)
-            shape_penalty = 0.62 / RC_real
-            orient_penalty = 1.05 if u['O'] in [3, 5] else 1.0
+            # GEOMETRY CORRECTION FACTOR
+            raw_factor = 0.62 / RC_real
             
-            eui_cool *= (shape_penalty * orient_penalty)
-            eui_heat *= (shape_penalty * orient_penalty)
-            note = f"Metode: Physics Penalty (Extreme Shape | Factor {shape_penalty:.2f}x)"
+            correction_factor = min(raw_factor, 3.0) 
+            
+            eui_cool *= correction_factor
+            eui_heat *= correction_factor
+            
+            note = f"Metode: Geometry Extrapolation (Correction Factor {correction_factor:.2f}x)"
 
-        # 3. Final Output (Phase 4)
+        eui_total = eui_cool + eui_heat
+        
         return {
             'RC': RC_real,
-            'Cool_Load': eui_cool * Total_Area,
-            'Heat_Load': eui_heat * Total_Area,
-            'EUI': eui_cool, # Kita fokus EUI Cooling buat skor
+            'Cool_Load': eui_cool * Total_Area, 
+            'Heat_Load': eui_heat * Total_Area, 
+            'EUI_Score': eui_total,             
             'Note': note
         }
 
-# --- BAGIAN 2: FRONTEND STREAMLIT (Tampilan) ---
+# ==========================================
+# BAGIAN 2: PDF REPORT GENERATOR
+# ==========================================
+class PDF(FPDF):
+    def header(self):
+        self.set_font('Arial', 'B', 16)
+        self.cell(0, 10, 'Laporan Simulasi Energi Bangunan', 0, 1, 'C')
+        
+        self.set_font('Arial', 'I', 10)
+        self.set_text_color(100, 100, 100)
+        self.cell(0, 10, f'Generated by Athena Energy Simulator | {datetime.now().strftime("%d-%m-%Y %H:%M")}', 0, 1, 'C')
+        self.set_text_color(0, 0, 0)
+        
+        self.ln(5)
+        self.set_draw_color(180, 180, 180) 
+        self.line(10, 30, 200, 30)
+        self.ln(5)
 
-# A. Konfigurasi Halaman
-st.set_page_config(page_title="Athena Energy Simulator", page_icon="🏛️", layout="wide")
+def create_pdf(result, user_data, recommendations, orient_label, dist_label):
+    pdf = PDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
 
-st.title("🏛️ Athena Energy Simulator")
-st.markdown("Simulasi beban energi bangunan di iklim Mediterania (Athena) menggunakan **GBR Physics Engine**.")
+    # --- Helper: Baris Tabel ---
+    def table_row(lbl1, val1, lbl2, val2):
+        pdf.set_font("Arial", 'B', 10)
+        pdf.set_fill_color(240, 240, 240)
+        pdf.cell(35, 8, f" {lbl1}", border=1, fill=True)
+        pdf.set_font("Arial", '', 10)
+        pdf.cell(60, 8, f" {str(val1)}", border=1)
+        pdf.set_font("Arial", 'B', 10)
+        pdf.cell(35, 8, f" {lbl2}", border=1, fill=True)
+        pdf.set_font("Arial", '', 10)
+        pdf.cell(60, 8, f" {str(val2)}", border=1, ln=1)
+
+    # --- Helper: Judul Seksi ---
+    def section_title(title):
+        pdf.ln(5)
+        pdf.set_font("Arial", 'B', 12)
+        pdf.set_fill_color(44, 62, 80)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(0, 8, f"  {title}", 0, 1, 'L', fill=True)
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(2)
+
+    # --- Helper: Blok Spesifikasi ---
+    def spec_block(title, items):
+        pdf.set_font("Arial", 'B', 9)
+        pdf.cell(0, 5, title, ln=1) 
+        pdf.set_font("Arial", '', 9)
+        for item in items:
+            pdf.cell(5) 
+            pdf.cell(0, 5, f"- {item}", ln=1) 
+        pdf.ln(2) 
+
+    # ================= ISI LAPORAN =================
+
+    # 1. IDENTITAS
+    section_title("1. IDENTITAS & KONFIGURASI DESAIN")
+    total_area = user_data['A1'] + user_data['A2']
+    table_row("Jumlah Lantai", f"{user_data['lantai']} Lantai", "Total Luas", f"{total_area} m2")
+    table_row("Orientasi", orient_label, "Compactness", f"RC: {result['RC']:.3f}")
+    table_row("Rasio Kaca", f"{user_data['RG']*100:.0f}%", "Sebaran Kaca", dist_label)
+
+    # 2. DIMENSI
+    section_title("2. DETAIL DIMENSI & ELEVASI")
+    pdf.set_font("Arial", 'B', 10)
+    pdf.cell(0, 8, f"Detail Lantai 1 (h: 3.5m):", 0, 1)
+    table_row("Luas Area", f"{user_data['A1']} m2", "Keliling", f"{user_data['P1']} m")
+    
+    if user_data['lantai'] == 2:
+        pdf.cell(0, 8, f"Detail Lantai 2 (h: 7.0m):", 0, 1)
+        table_row("Luas Area", f"{user_data['A2']} m2", "Keliling", f"{user_data['P2']} m")
+
+    # 3. HASIL ENERGI
+    section_title("3. PERFORMA ENERGI (GBR ENGINE)")
+    score = result['EUI_Score']
+    if score < 30: pdf.set_fill_color(200, 255, 200); status = "SANGAT EFISIEN"
+    elif score < 50: pdf.set_fill_color(255, 255, 200); status = "EFISIEN"
+    elif score < 70: pdf.set_fill_color(255, 220, 200); status = "STANDAR"
+    else: pdf.set_fill_color(255, 200, 200); status = "BOROS"
+    
+    pdf.set_font("Arial", 'B', 14)
+    pdf.cell(0, 12, f"Total EUI Score: {score:.2f} kWh/m2 ({status})", border=1, ln=1, align='C', fill=True)
+    
+    pdf.ln(3)
+    eui_c = result['Cool_Load'] / total_area
+    eui_h = result['Heat_Load'] / total_area
+    table_row("Cooling Load", f"{result['Cool_Load']:,.0f} kWh", "Intensity (Cool)", f"{eui_c:.2f} kWh/m2")
+    table_row("Heating Load", f"{result['Heat_Load']:,.0f} kWh", "Intensity (Heat)", f"{eui_h:.2f} kWh/m2")
+
+    # 4. REKOMENDASI
+    section_title("4. REKOMENDASI AI CONSULTANT")
+    pdf.set_font("Arial", '', 10)
+    if recommendations:
+        for rec in recommendations:
+            clean_rec = rec.replace("**", "").replace("⚠️", "[!]").replace("✅", "[OK]")
+            pdf.multi_cell(0, 6, txt=f"- {clean_rec}")
+            pdf.ln(1)
+    else:
+        pdf.cell(0, 10, "Desain sudah optimal.", ln=1)
+
+    # 5. METODOLOGI
+    section_title("5. ANALISIS METODOLOGI")
+    pdf.set_font("Arial", 'B', 10)
+    pdf.cell(0, 6, "Metode Kalkulasi Geometri:", 0, 1)
+    pdf.set_font("Arial", '', 9)
+    pdf.multi_cell(0, 5, txt=f"Nilai RC ({result['RC']:.3f}) dihitung berdasarkan rasio volume terhadap luas permukaan. "
+                             f"Volume referensi dikunci pada 771.75 m3 (Standar Ecotect) untuk validasi scaling.")
+    pdf.ln(2)
+    pdf.set_font("Arial", 'B', 10)
+    pdf.cell(0, 6, "Status Prediksi Model:", 0, 1)
+    pdf.set_font("Arial", '', 9)
+
+    if "Correction" in result['Note']: 
+        metode_txt = f"WARNING: {result['Note']}. Bentuk bangunan terdeteksi ekstrem (RC < 0.62). " \
+                     f"Model menerapkan faktor koreksi berbasis rasio luas permukaan. " \
+                     f"Faktor dibatasi maksimum 3.0x (System Failure Limit) karena beban termal di atas 300% " \
+                     f"mengindikasikan inefisiensi rancangan di luar batas toleransi sistem HVAC standar."
+    else:
+        metode_txt = f"VALID: {result['Note']}. Geometri berada dalam rentang optimal dataset (Interpolasi GBR)."
+    pdf.multi_cell(0, 5, txt=metode_txt)
+
+    # 6. LAMPIRAN
+    section_title("6. LAMPIRAN: PARAMETER SISTEM TETAP (FIXED)")
+    pdf.set_font("Arial", 'I', 9)
+    pdf.cell(0, 5, "Sumber Dataset: UCI Energy Efficiency (Tsanas & Xifara, 2012)", ln=1)
+    pdf.ln(2)
+
+    # Block 1: Lingkungan
+    spec_block("A. KONTEKS LINGKUNGAN & HUNIAN:", [
+        "Lokasi: Athena, Yunani (Iklim Mediterania)",
+        "Tipe: Hunian Residensial (7 Penghuni, 70W/orang)",
+        "Desain: Pakaian 0.6 clo, Kelembaban 60%, Airspeed 0.3 m/s"
+    ])
+
+    # Block 2: Material
+    spec_block("B. PROPERTI MATERIAL (U-VALUES W/m2K):", [
+        "Dinding: 1.780",
+        "Atap: 0.500",
+        "Lantai: 0.860",
+        "Jendela: 2.260"
+    ])
+
+    # Block 3: Beban Internal
+    spec_block("C. BEBAN INTERNAL & INFILTRASI:", [
+        "Lighting: 300 Lux",
+        "Internal Gains: 5 W/m2 (Sensible) & 2 W/m2 (Latent)",
+        "Infiltrasi: 0.5 ACH + 0.25 ACH (Sensitivitas Angin)"
+    ])
+
+    # Block 4: HVAC
+    spec_block("D. SISTEM HVAC (MIXED-MODE):", [
+        "Thermostat: 19C (Heating) - 24C (Cooling)",
+        "Efisiensi Sistem: 95%",
+        "Jadwal: 15-20 jam (Weekday), 10-20 jam (Weekend)"
+    ])
+
+    return pdf.output(dest='S').encode('latin-1')
+
+# ==========================================
+# BAGIAN 3: FRONTEND STREAMLIT
+# ==========================================
+
+st.set_page_config(page_title="Energy Efficiency Analytics", page_icon="🏛️", layout="wide")
+
+# --- JUDUL ---
+st.title("🏛️ Early-Stage Energy Efficiency Estimator")
+
+st.markdown("""
+**Transformasi Geometri menjadi Efisiensi Energi.**
+\nSebuah *Decision Support System* berbasis **Machine Learning** untuk estimasi beban energi hunian di iklim Mediterania (Athena). Dirancang khusus untuk tahap **Early-Stage Design**, sistem ini memungkinkan arsitek mengevaluasi dampak geometri terhadap efisiensi energi dengan cepat sebelum masuk ke tahap pengembangan detail.
+""")
+
 st.markdown("---")
 
-# B. Sidebar Input (Phase 1)
+# --- SIDEBAR INPUT ---
 with st.sidebar:
     st.header("1. Konfigurasi Bangunan")
-    lantai_opt = st.radio("Jumlah Lantai:", [1, 2], horizontal=True)
     
+    lantai_opt = st.radio(
+        "Jumlah Lantai:", 
+        options=[1, 2],
+        format_func=lambda x: f"{x} Lantai", 
+        captions=[
+            "Tinggi (h): 3.5m",  
+            "Tinggi (h): 7.0m"   
+        ],
+        horizontal=False
+    )
+    
+    # --- PHYSICS GUARD ---
     st.subheader("Dimensi Lantai 1")
-    a1 = st.number_input("Luas Area (m2)", value=100.0, step=1.0, key="a1")
-    p1 = st.number_input("Keliling (m)", value=40.0, step=0.5, key="p1")
+    a1 = st.number_input("Luas Area (m2)", value=100.0, step=1.0, min_value=10.0, key="a1")
+    
+    # 1. Hitung Batas Min & Max
+    min_p1_limit = 4 * math.sqrt(a1)
+    max_p1_limit = 2 * (a1 + 1)
+    
+    # 2. Smart Default
+    default_p1 = max(40.0, float(math.ceil(min_p1_limit)))
+    if default_p1 > max_p1_limit: default_p1 = max_p1_limit 
+    
+    p1 = st.number_input(
+        f"Keliling (m)", 
+        value=float(default_p1),       
+        min_value=float(min_p1_limit), 
+        max_value=float(max_p1_limit), 
+        step=0.5, 
+        key="p1",
+        help=f"""
+        Batas keliling fisik untuk Luas Area {a1} m².
+        \n* Min (Bentuk Persegi): {min_p1_limit:.1f} m
+        \n* Max (Bentuk Lorong): {max_p1_limit:.1f} m
+        """
+    )
     
     a2, p2 = 0.0, 0.0
     if lantai_opt == 2:
         st.subheader("Dimensi Lantai 2")
-        a2 = st.number_input("Luas Area Lt.2 (m2)", value=50.0, step=1.0, key="a2")
-        p2 = st.number_input("Keliling Lt.2 (m)", value=30.0, step=0.5, key="p2")
+        a2 = st.number_input("Luas Area Lt.2 (m2)", value=50.0, step=1.0, min_value=10.0, key="a2")
+        
+        min_p2_limit = 4 * math.sqrt(a2)
+        max_p2_limit = 2 * (a2 + 1)
+        
+        default_p2 = max(30.0, float(math.ceil(min_p2_limit)))
+        if default_p2 > max_p2_limit: default_p2 = max_p2_limit
+        
+        p2 = st.number_input(
+            f"Keliling Lt.2 (m)", 
+            value=float(default_p2),
+            min_value=float(min_p2_limit),
+            max_value=float(max_p2_limit),
+            step=0.5, 
+            key="p2",
+            help=f"""
+            Batas keliling fisik untuk Luas Area {a2} m².
+            \n* Min (Bentuk Persegi): {min_p2_limit:.1f} m
+            \n* Max (Bentuk Lorong): {max_p2_limit:.1f} m
+            """
+        )
     
     st.header("2. Desain Fasad")
-    orientasi = st.selectbox("Orientasi Utama", 
-                             options=[2, 3, 4, 5], 
-                             format_func=lambda x: {2:"Utara (Cool)", 3:"Timur", 4:"Selatan", 5:"Barat (Hot)"}[x])
     
-    glass_ratio = st.slider("Rasio Kaca Total (WWR)", 0.0, 0.40, 0.10, 0.01)
+    orient_options = {2:"Utara", 3:"Timur", 4:"Selatan", 5:"Barat"}
+    orientasi = st.selectbox(
+        "Orientasi Utama", 
+        options=list(orient_options.keys()), 
+        format_func=lambda x: orient_options[x],
+        help="""
+        Arah hadap fasad utama bangunan.
+        \n* Menentukan sudut datang sinar matahari.
+        \n* Mempengaruhi beban panas (Heat Gain) secara signifikan.
+        """
+    )
     
-    dist_map = {"Merata": 1, "Dominan Utara": 2, "Dominan Timur": 3, "Dominan Selatan": 4, "Dominan Barat": 5}
-    glass_dist = st.selectbox("Sebaran Kaca", options=list(dist_map.keys()))
+    glass_ratio = st.slider(
+        "Rasio Kaca (Glazing Area %)", 
+        0, 40, 10, 1, 
+        help="""
+        Persentase luas kaca terhadap total luas lantai (WFR).
+        \n* Sesuai standar dataset: Max 40%.
+        \n* Semakin tinggi % = Beban pendinginan (AC) makin berat.
+        """
+    )
+    
+    dist_map = {"Merata (Uniform)": 1, "Utara": 2, "Timur": 3, "Selatan": 4, "Barat": 5}
+    glass_dist = st.selectbox(
+        "Sebaran Kaca", 
+        options=list(dist_map.keys()), 
+        help="""
+        Sisi mana yang memiliki kaca paling dominan?
+        \n- **Merata**: Kaca dibagi rata ke 4 sisi.
+        \n- **Utara/Timur/dll**: Kaca terkonsentrasi di satu sisi saja.
+        """
+    )
 
     btn_hitung = st.button("🚀 Hitung Simulasi", type="primary")
 
-# C. Main Area (Phase 4 Output)
+    # --- SYSTEM CONFIGURATION INFO ---
+    st.markdown("---")
+    with st.expander("ℹ️ Spesifikasi Sistem & Asumsi Fixed"):
+        st.markdown("""
+        **1. Konteks Lingkungan & Hunian:**
+        * **Lokasi:** Athena, Yunani.
+        * **Tipe:** Hunian (7 Penghuni, Sedentary/70W).
+        * **Kondisi Desain:** Pakaian 0.6 clo, Humidity 60%, Airspeed 0.30 m/s.
+        
+        **2. Material Selubung (U-Values dalam W/m²K):**
+        * 🧱 Dinding: `1.780`
+        * 🏠 Atap: `0.500`
+        * 🦶 Lantai: `0.860`
+        * 🪟 Jendela: `2.260`
+        
+        **3. Beban Internal & Infiltrasi:**
+        * **Lighting:** 300 Lux.
+        * **Internal Gains:** 5 W/m² (Sensible) & 2 W/m² (Latent).
+        * **Infiltration:** 0.5 ACH + 0.25 ACH (Wind sensitivity).
+        
+        **4. Sistem HVAC (Mixed-Mode):**
+        * **Thermostat:** 19°C (Heating) - 24°C (Cooling).
+        * **Efisiensi Sistem:** 95%.
+        * **Operasional:** 15-20 jam (Weekday), 10-20 jam (Weekend).
+        
+        *Sumber: UCI Energy Efficiency Dataset (Tsanas & Xifara, 2012).*
+        """)
+
+# --- MAIN EXECUTION ---
 if btn_hitung:
     # 1. Collect Input
     user_data = {
         'lantai': lantai_opt,
         'A1': a1, 'P1': p1, 'A2': a2, 'P2': p2,
-        'O': orientasi, 'RG': glass_ratio, 'Dist': dist_map[glass_dist]
+        'O': orientasi, 
+        'RG': glass_ratio / 100.0, 
+        'Dist': dist_map[glass_dist]
     }
     
     # 2. Panggil Engine
-    engine = BuildingPerformanceEngine() # Load model
+    engine = BuildingPerformanceEngine() 
     result = engine.process_building(user_data)
     
-    # 3. Tampilkan Hasil
+    # 3. Logic AI Consultant
+    recommendations = []
+    
+    if result['RC'] > 0.75:
+        recommendations.append("⚠️ **Bentuk Terlalu Kompak (High RC):** Pertimbangkan menyebar massa bangunan.")
+    if user_data['RG'] > 0.20:
+        recommendations.append("⚠️ **Rasio Kaca Tinggi:** Kurangi Glazing Area untuk hemat energi.")
+    if user_data['O'] in [3, 5]: 
+        recommendations.append("⚠️ **Orientasi Timur/Barat:** Gunakan shading device.")
+    if result['EUI_Score'] < 30:
+        recommendations.append("✅ **Desain Excellent:** Sangat optimal!")
+
+    # 4. Dashboard View
+    # Row 1: Metrics Utama
+    total_area = user_data['A1'] + user_data['A2']
+    
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.metric("Estimasi Cooling Load", f"{result['Cool_Load']:.2f} kWh")
+        st.metric("Estimasi Cooling Load", f"{result['Cool_Load']:,.0f} kWh")
+        # Transparansi: EUI Cooling x Luas
+        eui_c = result['Cool_Load'] / total_area
+        st.caption(f"⚡{eui_c:.2f} kWh/m² × {total_area:g} m²")
+        
     with col2:
-        st.metric("Estimasi Heating Load", f"{result['Heat_Load']:.2f} kWh")
+        st.metric("Estimasi Heating Load", f"{result['Heat_Load']:,.0f} kWh")
+        # Transparansi: EUI Heating x Luas
+        eui_h = result['Heat_Load'] / total_area
+        st.caption(f"⚡{eui_h:.2f} kWh/m² × {total_area:g} m²")
+        
     with col3:
-        # Color Coding EUI
-        eui_val = result['EUI']
-        if eui_val < 0.18: color = "🟢 Sangat Efisien"
-        elif eui_val < 0.28: color = "🟡 Standar"
-        else: color = "🔴 Boros"
-        st.metric("Efisiensi (EUI Cooling)", f"{eui_val:.2f} kWh/m²", delta=color, delta_color="off")
-
-    # Detail Info
-    st.info(f"**Analisis Geometri:** RC Asli = {result['RC']:.3f} | {result['Note']}")
+        eui_val = result['EUI_Score']
+        # KLASIFIKASI
+        if eui_val < 30: 
+            color = "🟢 Sangat Efisien" 
+        elif eui_val < 50: 
+            color = "🟡 Efisien"      
+        elif eui_val < 70:
+            color = "🟠 Standar"      
+        else: 
+            color = "🔴 Boros"          
+            
+        st.metric("EUI Score (Cooling + Heating)", f"{eui_val:.2f} kWh/m²", delta=color, delta_color="off")
     
-    # Visualisasi Sederhana (Bar Chart)
-    chart_data = pd.DataFrame({
-        'Load Type': ['Cooling', 'Heating'],
-        'kWh': [result['Cool_Load'], result['Heat_Load']]
-    })
-    st.bar_chart(chart_data, x='Load Type', y='kWh', color='#FF4B4B')
+    # --- SECTION TRANSPARANSI TEKNIS ---
+    st.write("") 
+    
+    with st.expander("🔍 Detail Teknis & Metodologi (Klik untuk lihat)", expanded=True):
+        t_col1, t_col2 = st.columns([1, 2])
+        
+        with t_col1:
+            st.markdown("**Parameter Geometri:**")
+            st.write(f"- **Relative Compactness (RC):** `{result['RC']:.3f}`")
+            
+            if result['RC'] >= 0.90: shape_lbl = "📦 Sangat Kompak (Kubus)"
+            elif result['RC'] >= 0.62: shape_lbl = "Rectangular (Normal)"
+            else: shape_lbl = "📏 Memanjang/Tipis (Extreme)"
+            st.caption(f"Status: {shape_lbl}")
+
+        with t_col2:
+            st.markdown("**Metode Kalkulasi:**")
+            
+            
+            if "Correction" in result['Note']:
+                st.warning(f"⚠️ {result['Note']}")
+                st.caption("*Disclaimer: Bangunan memiliki bentuk ekstrem (RC < 0.62). Model menerapkan faktor koreksi geometri untuk menjaga validitas prediksi.*")
+            else:
+                st.success(f"✅ {result['Note']}")
+                st.caption("*Validasi: Geometri bangunan berada dalam jangkauan optimal dataset model (Interpolasi GBR).*")
+
+    st.markdown("---")
+
+    chart_col1, chart_col2 = st.columns([1, 1])
+    with chart_col1:
+        st.subheader("📊 Total Konsumsi (kWh)")
+        fig_bar = go.Figure(data=[
+            go.Bar(
+                x=['Cooling', 'Heating'],
+                y=[result['Cool_Load'], result['Heat_Load']],
+                marker_color=['#3498db', '#e74c3c'],
+                texttemplate='%{y:,.0f}', textposition='auto'
+            )
+        ])
+        fig_bar.update_layout(height=300, margin=dict(t=10, b=10, l=10, r=10))
+        st.plotly_chart(fig_bar, use_container_width=True)
+            
+    with chart_col2:
+        st.subheader("🎯 Skor Efisiensi (EUI)")
+        fig_gauge = go.Figure(go.Indicator(
+            mode = "gauge+number", value = result['EUI_Score'],
+            gauge = {
+                'axis': {'range': [0, 100]},
+                'bar': {'color': "darkblue"},
+                'steps': [
+                    {'range': [0, 30], 'color': "#2ecc71"},
+                    {'range': [30, 50], 'color': "#f1c40f"},
+                    {'range': [50, 70], 'color': "#e67e22"},
+                    {'range': [70, 100], 'color': "#e74c3c"}
+                ],
+                'threshold': {'line': {'color': "black", 'width': 4}, 'thickness': 0.75, 'value': result['EUI_Score']}
+            }
+        ))
+        fig_gauge.update_layout(height=300, margin=dict(t=10, b=10, l=20, r=20))
+        st.plotly_chart(fig_gauge, use_container_width=True)
+
+    st.markdown("---")
+    res_col1, res_col2 = st.columns([2, 1])
+    
+    with res_col1:
+        st.subheader("🤖 AI Design Consultant")
+        if recommendations:
+            for rec in recommendations:
+                st.markdown(rec)
+        else:
+            st.markdown("✅ Desain sudah seimbang.")
+            
+    with res_col2:
+        pdf_bytes = create_pdf(
+            result, 
+            user_data, 
+            recommendations, 
+            orient_options[orientasi], 
+            glass_dist                 
+        )
+        b64 = base64.b64encode(pdf_bytes).decode()
+        href = f'<a href="data:application/octet-stream;base64,{b64}" download="Laporan_Athena_Sim.pdf"><button style="width:100%; height:50px; background-color:#FF4B4B; color:white; border:none; border-radius:5px; cursor:pointer; font-weight:bold;">📥 Download PDF Report</button></a>'
+        st.markdown(href, unsafe_allow_html=True)
 
 else:
     st.info("👈 Masukkan parameter bangunan di sidebar dan tekan tombol Hitung.")

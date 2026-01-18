@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+joblib
+plotly
+fpdf
+base64
+math
+datetime
+openpyxl
