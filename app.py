@@ -214,7 +214,7 @@ def create_pdf(result, user_data, recommendations, orient_label, dist_label):
     # 6. LAMPIRAN
     section_title("6. LAMPIRAN: PARAMETER SISTEM TETAP (FIXED)")
     pdf.set_font("Arial", 'I', 9)
-    pdf.cell(0, 5, "Sumber Dataset: UCI Energy Efficiency (Tsanas & Xifara, 2012)", ln=1)
+    pdf.cell(0, 5, "Sumber Dataset: UCI Energy Efficiency (Tsanas & Xifara)", ln=1)
     pdf.ln(2)
 
     # Block 1: Lingkungan
@@ -255,11 +255,11 @@ def create_pdf(result, user_data, recommendations, orient_label, dist_label):
 st.set_page_config(page_title="Energy Efficiency Analytics", page_icon="🏛️", layout="wide")
 
 # --- JUDUL ---
-st.title("🏛️ Early-Stage Energy Efficiency Estimator")
+st.title("🏛️ Building Energy Efficiency Estimator")
 
 st.markdown("""
 **Transformasi Geometri menjadi Efisiensi Energi.**
-\nSebuah *Decision Support System* berbasis **Machine Learning** untuk estimasi beban energi hunian di iklim Mediterania (Athena). Dirancang khusus untuk tahap **Early-Stage Design**, sistem ini memungkinkan arsitek mengevaluasi dampak geometri terhadap efisiensi energi dengan cepat sebelum masuk ke tahap pengembangan detail.
+\nSebuah *Decision Support System* berbasis **Machine Learning** untuk estimasi beban energi hunian di iklim Mediterania (Athena). Dirancang khusus untuk **Early-Stage Design**, sistem ini memungkinkan evaluasi dampak geometri terhadap efisiensi energi secara instan.
 """)
 
 st.markdown("---")
@@ -350,18 +350,28 @@ with st.sidebar:
         help="""
         Persentase luas kaca terhadap total luas lantai (WFR).
         \n* Sesuai standar dataset: Max 40%.
-        \n* Semakin tinggi % = Beban pendinginan (AC) makin berat.
+        \n* Semakin tinggi % = Beban pengatur suhu makin berat.
         """
     )
     
-    dist_map = {"Merata (Uniform)": 1, "Utara": 2, "Timur": 3, "Selatan": 4, "Barat": 5}
+    dist_map = {
+        "Tidak Ada (None)": 0, 
+        "Merata (Uniform)": 1, 
+        "Utara": 2, 
+        "Timur": 3, 
+        "Selatan": 4, 
+        "Barat": 5
+    }
+    
     glass_dist = st.selectbox(
         "Sebaran Kaca", 
         options=list(dist_map.keys()), 
+        index=1, 
         help="""
         Sisi mana yang memiliki kaca paling dominan?
+        \n- **Tidak Ada**: Pilih ini jika Rasio Kaca 0%.
         \n- **Merata**: Kaca dibagi rata ke 4 sisi.
-        \n- **Utara/Timur/dll**: Kaca terkonsentrasi di satu sisi saja.
+        \n- **Utara/Timur/dll**: Kaca dominan di sisi tertentu.
         """
     )
 
@@ -392,35 +402,90 @@ with st.sidebar:
         * **Efisiensi Sistem:** 95%.
         * **Operasional:** 15-20 jam (Weekday), 10-20 jam (Weekend).
         
-        *Sumber: UCI Energy Efficiency Dataset (Tsanas & Xifara, 2012).*
+        *Sumber: UCI Energy Efficiency Dataset (Tsanas & Xifara).*
         """)
 
 # --- MAIN EXECUTION ---
 if btn_hitung:
-    # 1. Collect Input
+    # AUTO-CORRECT
+    raw_rg = glass_ratio / 100.0
+    raw_dist = dist_map[glass_dist]
+    
+    if raw_dist == 0:
+        final_rg = 0.0
+        final_dist = 0
+    elif raw_rg == 0.0:
+        final_rg = 0.0
+        final_dist = 0
+    else:
+        final_rg = raw_rg
+        final_dist = raw_dist
+
+    # 1. Collect Input 
     user_data = {
         'lantai': lantai_opt,
         'A1': a1, 'P1': p1, 'A2': a2, 'P2': p2,
         'O': orientasi, 
-        'RG': glass_ratio / 100.0, 
-        'Dist': dist_map[glass_dist]
+        'RG': final_rg,    
+        'Dist': final_dist 
     }
     
-    # 2. Panggil Engine
+    # 2. Panggil Engine 
     engine = BuildingPerformanceEngine() 
     result = engine.process_building(user_data)
     
     # 3. Logic AI Consultant
+    warnings = [] 
+    
+    # --- CEK 1: GEOMETRI EKSTREM (RC < 0.62) ---
+    if result['RC'] < 0.62:
+        warnings.append(
+            "⚠️ **Geometri Ekstrem (RC < 0.62):** Bentuk bangunan terdeteksi terlalu memanjang, menghasilkan luas permukaan selubung yang berlebihan. "
+            "Saran: Sederhanakan gubahan massa agar lebih kompak untuk mengurangi area kebocoran energi."
+        )
+
+    # --- CEK 2: LANTAI 2 (Inefisiensi Vertikal) ---
+    elif user_data['lantai'] == 2:
+        warnings.append(
+            "⚠️ **Inefisiensi Vertikal:** Konfigurasi 2 lantai mengurangi area kontak efektif dengan tanah (*Ground Coupling*). "
+            "Akibatnya, lantai atas kehilangan manfaat stabilisasi suhu alami dan lebih rentan terhadap panas udara luar. "
+            "Saran: Jika lahan memungkinkan, pertimbangkan desain 1 lantai untuk efisiensi termal pasif."
+        )
+
+    # --- CEK 3: KACA (Thermal Bridge) ---
+    if user_data['RG'] > 0.15:
+        warnings.append(
+            f"⚠️ **Eksposur Termal Kaca:** Rasio bukaan {user_data['RG']*100:.0f}% melebihi ambang batas efisiensi, berpotensi menjadi jembatan panas (*Thermal Bridge*) utama. "
+            "Saran: Batasi rasio kaca di bawah 15% atau terapkan strategi peneduh eksternal (*shading*) yang masif."
+        )
+
+    # --- CEK 4: ORIENTASI (Contextual Analysis) ---
+    is_cooling_dominant = result['Cool_Load'] > result['Heat_Load']
+    
+    # Skenario A: Dominasi Cooling (Isu Matahari Sore)
+    if is_cooling_dominant and user_data['O'] in [2, 5]: 
+        warnings.append(
+            "⚠️ **Akumulasi Panas Matahari:** Orientasi Utara/Barat terdeteksi berkontribusi dominan terhadap tingginya beban pendinginan. "
+            "Saran: Lakukan reorientasi massa bangunan atau berikan proteksi fasad ganda pada sisi ini."
+        )
+    
+    # Skenario B: Dominasi Heating (Isu Infiltrasi/Heat Loss)
+    elif not is_cooling_dominant and user_data['O'] in [3, 4]:
+        warnings.append(
+            "⚠️ **Pelepasan Panas (*Heat Loss*):** Orientasi Timur/Selatan terindikasi memperparah beban pemanas bangunan. "
+            "Saran: Tingkatkan spesifikasi kekedapan udara (*Air Tightness*) pada bukaan di sisi ini."
+        )
+
+    # --- FINAL DECISION ---
     recommendations = []
     
-    if result['RC'] > 0.75:
-        recommendations.append("⚠️ **Bentuk Terlalu Kompak (High RC):** Pertimbangkan menyebar massa bangunan.")
-    if user_data['RG'] > 0.20:
-        recommendations.append("⚠️ **Rasio Kaca Tinggi:** Kurangi Glazing Area untuk hemat energi.")
-    if user_data['O'] in [3, 5]: 
-        recommendations.append("⚠️ **Orientasi Timur/Barat:** Gunakan shading device.")
-    if result['EUI_Score'] < 30:
-        recommendations.append("✅ **Desain Excellent:** Sangat optimal!")
+    if len(warnings) > 0:
+        recommendations = warnings
+    else:
+        recommendations.append(
+            "✅ **KONFIGURASI OPTIMAL:** Parameter geometri, orientasi, dan rasio bukaan telah memenuhi standar efisiensi energi terbaik berdasarkan pola data historis. "
+            "Tidak ada rekomendasi perbaikan lebih lanjut."
+        )
 
     # 4. Dashboard View
     # Row 1: Metrics Utama
@@ -442,7 +507,8 @@ if btn_hitung:
         
     with col3:
         eui_val = result['EUI_Score']
-        # KLASIFIKASI
+        
+        # KLASIFIKASI 4 WARNA
         if eui_val < 30: 
             color = "🟢 Sangat Efisien" 
         elif eui_val < 50: 
@@ -451,8 +517,23 @@ if btn_hitung:
             color = "🟠 Standar"      
         else: 
             color = "🔴 Boros"          
+        
+        # DEFINISI TOOLTIP 
+        eui_help = """
+        Klasifikasi (Energy Use Intensity):
+        \n🟢 **Sangat Efisien**: < 30 kWh/m²
+        \n🟡 **Efisien**: 30 - 50 kWh/m²
+        \n🟠 **Standar**: 50 - 70 kWh/m²
+        \n🔴 **Boros**: > 70 kWh/m²
+        """
             
-        st.metric("EUI Score (Cooling + Heating)", f"{eui_val:.2f} kWh/m²", delta=color, delta_color="off")
+        st.metric(
+            "EUI Score (Cooling + Heating)", 
+            f"{eui_val:.2f} kWh/m²", 
+            delta=color, 
+            delta_color="off",
+            help=eui_help 
+        )
     
     # --- SECTION TRANSPARANSI TEKNIS ---
     st.write("") 
@@ -461,21 +542,54 @@ if btn_hitung:
         t_col1, t_col2 = st.columns([1, 2])
         
         with t_col1:
-            st.markdown("**Parameter Geometri:**")
-            st.write(f"- **Relative Compactness (RC):** `{result['RC']:.3f}`")
+            # ... (Bagian Text Help sama kayak tadi) ...
+            rc_help_text = """
+            RELATIVE COMPACTNESS (RC):
+            Indikator efisiensi bentuk geometri bangunan terhadap kubus sempurna.
+
+            RUMUS KALKULASI:
+            RC = (6 × V⅔) ÷ A
             
-            if result['RC'] >= 0.90: shape_lbl = "📦 Sangat Kompak (Kubus)"
-            elif result['RC'] >= 0.62: shape_lbl = "Rectangular (Normal)"
-            else: shape_lbl = "📏 Memanjang/Tipis (Extreme)"
+            DIMANA:
+            • V = Volume Bangunan (m³)
+            • A = Luas Permukaan (m²)
+            • ⅔ = Pangkat rasio volume
+            
+            INTERPRETASI SKOR:
+            • 1.00 : Kubus Sempurna 
+            • 0.88 : Persegi Panjang Ideal
+            • < 0.65 : Pipih / Memanjang 
+
+            Ref: Tsanas & Xifara (2012), Energy & Buildings, Vol. 49
+            """
+            
+            st.markdown("**Parameter Geometri:**")
+            
+            if result['RC'] >= 0.90: 
+                shape_lbl = "📦 Sangat Compact (Kubus)"
+                rc_color = "#2ecc71" 
+            elif result['RC'] >= 0.62: 
+                shape_lbl = "Rectangular (Normal)"
+                rc_color = "#2ecc71" 
+            else: 
+                shape_lbl = "📏 Memanjang/Tipis (Extreme)"
+                rc_color = "#fae695" 
+            
+            st.markdown("Relative Compactness (RC)", help=rc_help_text)
+            
+            st.markdown(f"""
+            <div style="font-size: 28px; font-weight: bold; color: {rc_color}; margin-top: -10px; margin-bottom: 5px;">
+                {result['RC']:.3f}
+            </div>
+            """, unsafe_allow_html=True)
+            
             st.caption(f"Status: {shape_lbl}")
 
         with t_col2:
             st.markdown("**Metode Kalkulasi:**")
-            
-            
             if "Correction" in result['Note']:
                 st.warning(f"⚠️ {result['Note']}")
-                st.caption("*Disclaimer: Bangunan memiliki bentuk ekstrem (RC < 0.62). Model menerapkan faktor koreksi geometri untuk menjaga validitas prediksi.*")
+                st.caption("*Disclaimer: Bangunan memiliki bentuk ekstrem (RC < 0.62). Model menerapkan Faktor Koreksi Geometri untuk menjaga validitas prediksi.*")
             else:
                 st.success(f"✅ {result['Note']}")
                 st.caption("*Validasi: Geometri bangunan berada dalam jangkauan optimal dataset model (Interpolasi GBR).*")
