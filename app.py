@@ -641,6 +641,8 @@ if btn_hitung:
             st.markdown("✅ Desain sudah seimbang.")
             
     with res_col2:
+        st.markdown("<br>", unsafe_allow_html=True) 
+        
         pdf_bytes = create_pdf(
             result, 
             user_data, 
